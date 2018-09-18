@@ -27,7 +27,8 @@ void testall(void) {
 }
 
 
-void
+int
 main(int argc, char *argv[]) {
   testall();
+  return 0;
 }
