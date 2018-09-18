@@ -210,7 +210,7 @@ table_each(struct table *t, void (*fn)(struct entry *, void *), void *data);
 Just a few notes on the otherwise standard implementation:
 - There's no need to implement a /delete/ operation on keys. Once the
   dictionary is loaded, it will only be read. 
-- I opt for the DJB2 hashing function. It's simple and has reasonable
+- I opt for the [[http://www.cse.yorku.ca/~oz/hash.html][DJB2]] hashing function. It's simple and has reasonable
   distribution on strings.
 
 
