@@ -1041,7 +1041,7 @@ readability of a Wikipedia excerpt on the Empire State Building.
 #+begin_src makefile :exports code
 .PHONY: demo
 demo: $(exe)
-	@./$(exe) -d $(txtdir)/sample_dic $(txtdir)/sample.txt
+	@LD_LIBRARY_PATH=$(libdir) ./$(exe) -d $(txtdir)/sample_dic $(txtdir)/sample.txt
 #+end_src
 
 #+name: Sample Text
@@ -1131,7 +1131,7 @@ void testall(void) {
 }
 
 
-int
+void
 main(int argc, char *argv[]) {
   testall();
 }

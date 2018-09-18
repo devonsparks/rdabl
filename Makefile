@@ -72,4 +72,4 @@ check: $(tstexe)
 
 .PHONY: demo
 demo: $(exe)
-	@./$(exe) -d $(txtdir)/sample_dic $(txtdir)/sample.txt
+	@LD_LIBRARY_PATH=$(libdir) ./$(exe) -d $(txtdir)/sample_dic $(txtdir)/sample.txt
