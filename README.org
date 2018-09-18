@@ -1,0 +1,1914 @@
+#+TITLE: rdabl: A readability calculator for English ASCII text
+#+AUTHOR: Devon Sparks
+
+* Introduction
+
+While stuck on a transatlantic flight, cross-eyed and unable to sleep,
+I go to wondering how to estimate the "readability" of English
+text. This literate program, written in part at 35,000 ft, is the
+result.
+
+** The Flesh-Kinclaid Readability Index
+
+The good news is that
+- lots of smart people have thought about this problem
+- there are several formulae available for estimating text
+  readability, in English at least
+- many of these formulae require only simply forms of counting
+
+Of the well-known algorithms, I targeted the [[https://en.wikipedia.org/wiki/Flesch%E2%80%93Kincaid_readability_tests][Flesh-Kinclaid
+Readability Index]] for implementation because:
+- it's been field tested enough to have a [[https://en.wikipedia.org/wiki/United_States_Military_Standard][MilSpec]]
+- it only requires the calculation of total sentences, words, and
+syllables on the input text. 
+
+This lets me refine my original goal of calculating readability to
+calculating sentence, word, and syllable counts on an input file. This
+is a tractable problem.
+
+* Plan of Attack
+** Overall Project Structure
+
+I'll start by creating a basic Makefile template. The ultimate goal is
+to set up the dependency graph to produce /rdabl/, a POSIX command line
+executable for calculating readability scores for English ASCII text.
+
+#+name: org-Makefile
+#+begin_src makefile :exports code :noweb tangle :tangle Makefile 
+prog=rdabl
+
+.PHONY: default
+default: all
+
+<<Makefile-Tooling-Variables>>
+
+<<Makefile-Target-Variables>>
+
+all: <<Makefile-All>>
+
+<<Makefile-Real-Targets>>
+
+<<Makefile-Phony-Targets>>
+#+end_src 
+
+Writing in C, I'll need a least locations for source, binary, and
+include files, as well as flags for the compiler. 
+
+#+name: Makefile-Tooling-Variables
+#+begin_src makefile :exports code 
+srcdir=src
+bindir=bin
+incdir=inc
+libdir=lib
+
+cc=LD_LIBRARY_PATH=$(libdir) gcc
+cflags=-I$(incdir) -Wall -g
+
+#+end_src
+
+I'll add specific Makefile targets as the /rdabl/ is developed below.
+
+** Counting Strategy
+
+The goal is to create a program that can estimate sentence, word, and
+syllables counts from an input stream. This should be feasible with
+finite automata and static variables: look for a text pattern that
+indicates the end of a sentence, word, or syllable and increment the
+associated variable. But how to tell where to break the syllables
+common words, like the last three letters of "spatial" or "celestial"?
+It seems there's no foolproof way -- at least without a lot of
+linguistics and neural networks. Instead, I'll opt for a hybrid
+approach: use a dictionary of words with known syllable counts when
+possible and fall back on simple heuristics otherwise. For this, I
+need a dictionary of English words and known syllable counts, along
+with a symbol table to store them in.
+
+* The Syllable Dictionary
+
+The syllable dictionary could contain a list of known words and their
+syllable counts. Rather than writing this list by hand, I'll leverage
+the [[http://www.speech.cs.cmu.edu/cgi-bin/cmudict][CMU Pronunciating Dictionary]], which associates words to
+phonemes. See [[Licenses]] for the conditions around acceptable use.
+
+#+name: Makefile-Tooling-Variables
+#+begin_src makefile :exports code
+txtdir=txt
+#+end_src
+
+#+name: Makefile-Real-Targets
+#+begin_src makefile :exports code
+$(txtdir)/cmudic:
+	mkdir -p $(txtdir)
+	wget http://svn.code.sf.net/p/cmusphinx/code/trunk/cmudict/cmudict-0.7b -O $@
+
+#+end_src 
+
+The CMU Dictionary stores one entry per line -- a word, followed by a
+space, followed by the set of [[https://en.wikipedia.org/wiki/Phoneme][phonemes]] that capture its
+pronunciation. The phonemes that map to syllables will have first or
+second [[https://en.wikipedia.org/wiki/Stress_(linguistics)][stress]] flags, indicated by a (0), (1) or (2) in the phoneme
+encoding. So, summing all the occurrences of '0', '1' or '2' on a
+given line after the word itself determines the number of syllables in
+that word. A quick preprocessing script can reduce the dictionary
+automatically, outputting a new file that puts one entry per line: a
+word and a syllable count, separated by a space.
+
+#+name: parsecmu
+#+begin_src python :exports code :tangle src/parsecmu :mkdirp yes :padline no
+#!/usr/bin/env python
+
+import sys
+
+def parse(fp):
+    for line in fp:    
+        if line[0:3] == ';;;':
+            continue
+        try:
+            (word, syls) = line.split(' ',1)
+        except:
+            continue
+        word = word.rstrip()
+        if any(not (i >= 'A' and i <= 'Z' or i == '\'') for i in word):
+            continue
+        sys.stdout.write("%s %s\n"%(word, [i.isdigit() for i in syls].count(True)))
+
+
+if __name__ == "__main__":
+     parse(sys.stdin)
+
+#+end_src
+
+#+name: Makefile-Target-Variables
+#+begin_src makefile :exports code
+$(txtdir)/sample_dic: $(txtdir)/cmudic
+	chmod +x $(srcdir)/parsecmu
+	cat $< | $(srcdir)/parsecmu > $@
+#+end_src
+
+Next, I need to organize these entries in memory so they're accessible
+at runtime.
+
+* A Simple Symbol Table 
+
+Looking up the syllable count for a given word needs to be fast
+because it will be called for every word in the input stream. A symbol
+table with constant time lookup is a natural choice. 
+
+
+#+name: Symbol-Table-Interface
+#+begin_src c :exports code :noweb tangle :tangle inc/table.h :mkdirp yes
+
+#ifndef TABLEH_INCLUDED
+#define TABLEH_INCLUDED
+
+
+typedef enum TableStatus {
+  SUCCESS,
+  FAIL_UNKNOWN,
+  FAIL_TABLE_ALLOC,
+  FAIL_BUCKET_ALLOC,
+  FAIL_ENTRY_ALLOC,
+  FAIL_STR_ALLOC,
+  FAIL_MISSING
+} tablestatus;
+
+
+struct table;
+struct entry;
+
+
+char *
+entry_word(struct entry *e);
+
+signed int
+entry_value_get(struct entry *e);
+
+void
+entry_value_set(struct entry *e, int value); 
+
+tablestatus
+table_create(struct table **t, unsigned long size);
+
+tablestatus
+table_add(struct table *t, char *word, int value);
+
+tablestatus
+table_get(struct table *t, const char *word, struct entry **e);
+
+void
+table_free(struct table *t);
+
+void
+table_each(struct table *t, void (*fn)(struct entry *, void *), void *data);
+
+
+#endif
+
+#+end_src
+
+Just a few notes on the otherwise standard implementation:
+- There's no need to implement a /delete/ operation on keys. Once the
+  dictionary is loaded, it will only be read. 
+- I opt for the DJB2 hashing function. It's simple and has reasonable
+  distribution on strings.
+
+
+#+name: Symbol-Table-Implementation
+#+begin_src c :exports code :noweb tangle :tangle src/table.c :mkdirp yes
+#include <stdlib.h>
+#include <stdio.h>
+#include <assert.h> /* assert */
+#include <string.h> /* strncpy */
+#include "table.h"
+
+struct entry {
+  char *word;
+  int value;
+  struct entry *next;
+};
+
+
+struct table {
+  unsigned long size;
+  struct entry **buckets;
+};
+
+
+char *
+entry_word(struct entry *e) {
+  assert(e);
+  return e->word;
+}
+
+
+signed int
+entry_value_get(struct entry *e) {
+  assert(e);
+  return e->value;
+}
+
+
+void
+entry_value_set(struct entry *e, int value) {
+  assert(e);
+  e->value = value;
+}
+
+
+tablestatus
+entry_create(char *word, unsigned char len, int value, struct entry **e) {
+
+  if((*e = malloc(sizeof(struct entry))) == NULL) {
+    return FAIL_ENTRY_ALLOC;
+  }
+  
+  if(((*e)->word = malloc(sizeof(unsigned char)*len + 1)) == NULL) {    
+    free(*e);
+    return FAIL_STR_ALLOC;
+  }
+
+  (*e)->value = value;
+  (*e)->next = NULL;
+  strncpy((*e)->word, word, len);
+  (*e)->word[len] = '\0';
+
+  return SUCCESS;
+}
+
+
+static void
+entry_free(struct entry *e) {
+  assert(e);
+  free(e->word);
+  free(e);
+}
+
+
+static unsigned long
+djb2_hash(const char *str)
+{
+  unsigned long hash = 5381;
+  int c;
+
+  while ((c = *str++) != '\0') {
+    hash = ((hash << 5) + hash) + c;
+  }
+
+  return hash;
+}
+
+
+tablestatus
+table_create(struct table **t, unsigned long size) {
+
+  if((*t = malloc(sizeof(struct table))) == NULL) {
+    return FAIL_TABLE_ALLOC;
+  }
+
+  if(((*t)->buckets = malloc(sizeof(struct entry*) * size)) == NULL) {
+    free(*t);
+    return FAIL_BUCKET_ALLOC;
+  }
+
+  (*t)->size = size;
+  while(size) {
+    (*t)->buckets[--size] = NULL;
+  }
+
+  return SUCCESS;
+}
+
+
+tablestatus
+table_add(struct table *t, char *word, int value) {
+  assert(t);
+
+  tablestatus s;
+  unsigned long hash;
+  struct entry *new = NULL, *current = NULL;
+
+    
+  hash = djb2_hash(word) % t->size;
+  current = t->buckets[hash];
+
+  if(current == NULL) {                  /* bucket empty */
+    if((s=entry_create(word, strlen(word), value, &new) == SUCCESS)) {
+      t->buckets[hash] = new;
+    }
+    return SUCCESS;
+  }
+  else {                                 /* bucket already has entries */
+    while(current && current->next && (strcmp(word, current->word) != 0)) {
+      current = current->next;
+    }
+   
+    if(strcmp(word, current->word) == 0) { /* entry already entered */
+      //current->occurrences++;
+      current->value = value;
+      return SUCCESS;
+    }                                    /* entry is new */
+    else if((s=entry_create(word, strlen(word), value, &new)) == SUCCESS) {
+      current->next = new;
+      return SUCCESS;
+    }
+    else {                               /* allocation failed */
+      return s;
+    }
+  }  
+}
+  
+
+tablestatus
+table_get(struct table *t, const char *word, struct entry **e) {
+  assert(t);
+  
+  unsigned char diff = 0;
+  
+  *e = t->buckets[djb2_hash(word) % t->size];
+  while(*e && (*e)->next) {
+    if ((diff = strcmp((*e)->word, word)) == 0) {
+      break;
+    }
+    *e = (*e)->next;
+  }
+  return (!(*e) || diff) ? FAIL_MISSING : SUCCESS;
+}
+
+
+void
+table_free(struct table *t) {
+  assert(t);
+
+  struct entry *e, *next;
+  while(t->size) {
+    e = t->buckets[--(t->size)];
+    while(e) {
+      next = e->next;
+      entry_free(e);
+      e = next;
+    }
+  }
+  free(t->buckets);
+  free(t);
+}
+
+
+void
+table_each(struct table *t, void (*fn)(struct entry *, void *), void *data) {
+  unsigned long i = t->size;
+  struct entry *e;
+  while(i) {
+    e = t->buckets[--(i)];
+    while(e) {
+      fn(e, data);
+      e = e->next;
+    }
+  }
+}
+
+#+end_src
+
+* Scanning Input
+
+A hybrid approach to calculating readability requires that /rdabl/
+scan up to two input streams at runtime: the dictionary of stored
+word-syllable count pairs, and the original text. The scanners run in
+sequence -- the first (optionally) reads the syllable dictionary from
+disk, producing a /struct table/ of known syllable counts, while the
+latter uses that dictionary to refine syllable estimates made while
+scanning the input text.
+
+#+name: Scanner-Interface
+#+begin_src c :exports none :noweb tangle :tangle inc/scan.h :mkdirp yes
+#ifndef SCANH_INCLUDED
+#define SCANH_INCLUDED
+
+#include "table.h"
+
+<<Scanner-Dictionary-Interface>>
+
+<<Scanner-Text-Interface>>
+
+#endif
+
+#+end_src
+
+The Dictionary Scanner should take an input stream (as a FILE *) and
+return a dictionary populated with word-syllable count pairs. 
+
+#+name: Scanner-Dictionary-Interface
+#+begin_src c :exports code
+void
+parsedic(FILE *fp,
+	 struct table *dic);
+#+end_src
+
+The Text Scanner should take take an input stream, pointers to
+sentence, word, and syllable counts to be incremented respectively,
+and an (optional) pointer to the syllable dictionary.
+
+#+name: Scanner-Text-Interface
+#+begin_src c :exports code
+void
+parsetxt(FILE *fp,
+	 unsigned int *sents,
+	 unsigned int *words,
+	 unsigned int *syls,
+	 struct table *dic);
+#+end_src
+
+The two scanners will share general structure, so it makes sense to
+place them in the same file with common support code.
+
+#+name: Scanner-Implementation
+#+begin_src c :exports code :noweb tangle :tangle src/scan.c :mkdirp yes
+<<Scanner-Includes>>
+
+<<Scanner-Macros>>
+
+<<Scanner-Declarations>>
+
+<<Scanner-Text-Scanner>>
+
+<<Scanner-Dictionary-Scanner>>
+#+end_src
+
+** Scanning Input Dictionary
+
+The [[parsecmu][parsing script]] above produces a dictionary file where each line:
+- Begins with a sequence of one or more ASCII letters (a-z, A-Z, or
+  hyphen) representing a word
+- Then has a separator character (a space by default)
+- Then has a positive integer representing the syllable count
+- And finishes with a newline
+
+Any other sequence is an error. 
+
+This definition has a direct implementation as a finite
+automaton. First, let's define its possible states (with a final
+state, Dic_Count, equal to the number of states, and used for
+indexing arrays; this should work in any ANSI compliant C compiler):
+
+#+name: Scanner-Declarations
+#+begin_src c :exports code
+typedef enum DicState {
+  Dic_Start,
+  Dic_Letter,
+  Dic_Sep,
+  Dic_Digit,
+  Dic_NL,
+  Dic_Fail,
+  Dic_Count
+} DicState;
+
+#+end_src
+
+Next, map the dictionary grammar to a transition table; rows
+represent states, columns represent events. 
+
+#+name: Scanner-Declarations
+#+begin_src c :export code
+
+static DicState
+dfa[Dic_Count][Dic_Count] = {
+    /*               Dic_Start   Dic_Letter   Dic_Sep   Dic_Digit   Dic_NL    Dic_Fail  */   
+    /* Dic_Start  */ {Dic_Fail,  Dic_Letter,  Dic_Fail, Dic_Fail,   Dic_NL,   Dic_Fail},
+    /* Dic_Letter */ {Dic_Fail,  Dic_Letter,  Dic_Sep,  Dic_Fail,   Dic_Fail, Dic_Fail},
+    /* Dic_Sep    */ {Dic_Fail,  Dic_Fail,    Dic_Sep,  Dic_Digit,  Dic_Fail, Dic_Fail},    
+    /* Dic_Digit  */ {Dic_Fail,  Dic_Fail,    Dic_Fail, Dic_Digit,  Dic_NL,   Dic_Fail},    
+    /* Dic_NL     */ {Dic_Fail,  Dic_Letter,  Dic_Fail, Dic_Fail,   Dic_NL,   Dic_Fail},
+    /* Dic_Fail   */ {Dic_Fail,  Dic_Fail,    Dic_Fail, Dic_Fail,   Dic_Fail, Dic_Fail}
+  };
+
+#+end_src
+
+Macros make it easy to classify a character of the input stream
+as belonging to a particular state or event.
+
+#+name: Scanner-Macros
+#+begin_src c :exports code
+#define LETTER(l)(((l) >= 'A' && ((l) <= 'Z')) || ((l) == '\''))
+#define DIGIT(l) ((l) >= '0' && (l) <= '9')
+#define NL(l)    ((l) == '\n')
+#define SP(l)    ((l) == ' ')
+#+end_src
+
+The core of the Dictionary Scanner is then pretty simple: iterate over
+the characters, updating state based on the transition table, and
+triggering any side effects associated with the transition.
+
+#+name: Scanner-Includes
+#+begin_src c :exports code
+#include <stdio.h>  /* FILE */
+
+#include "scan.h"
+#+end_src
+
+#+name: Scanner-Dictionary-Scanner
+#+begin_src c :exports code
+
+void
+parsedic(FILE *fp, struct table *dic) {
+  DicState s, snext;
+  unsigned int wi, sylcnt;
+  char c, wordbuf[WORDSIZE] = {'\0'};
+  
+  s = Dic_Start;
+  wi = sylcnt = 0;
+ 
+  while(1) {
+    c = toupper(fgetc(fp));
+
+    /* terminating conditions */
+    if(c == '\0' || c == EOF || s == Dic_Fail) break;
+    
+    /* map characters to states */
+    if      (LETTER(c)) { snext = Dic_Letter;  }
+    else if (DIGIT(c))  { snext = Dic_Digit;   }
+    else if (NL(c))     { snext = Dic_NL;      }
+    else if (SP(c))     { snext = Dic_Sep;     } // changed from SEP
+    else                { snext = Dic_Fail;    }
+
+    /* side effects */
+    if(snext == Dic_Letter && wi < (WORDSIZE - 1)) {
+      wordbuf[wi++] = c;
+    }
+    else if (s == Dic_Letter && snext == Dic_Sep) {
+      wordbuf[wi] = '\0';
+      wi = 0;
+    }
+    else if(snext == Dic_Digit) {
+      sylcnt = (sylcnt * 10) + (c - '0');
+    }
+    else if(s == Dic_Digit && snext == Dic_NL) {
+      table_add(dic, wordbuf, sylcnt);
+      wordbuf[0] = '\0';
+      sylcnt = wi = 0;
+    }
+    
+    /* update state */
+    s = dfa[s][snext];
+  }
+}
+#+end_src
+
+With the longest word in common English dictionaries having 45
+letters (the lung disease
+[[https://en.wikipedia.org/wiki/Pneumonoultramicroscopicsilicovolcanoconiosis][Pneumonoultramicroscopicsilicovolcanoconiosis']]), a allocating a 128
+character buffer for processing the current word should be plenty of
+space. In the rare case it isn't, the word will be truncated to fit.
+
+#+name: Scanner-Includes
+#+begin_src c :exports code
+#define WORDSIZE 128
+#+end_src
+
+
+** Scanning Input Text
+
+The text scanner requires a few more conditions. Unlike the dictionary
+scanner, the text scanner has a unrestricted grammar, meaning it can
+do without an explicit transition table. For every state Si, event Ei,
+(S1 ✕ E1) → S2 ⇔ E1. Suitable states for syllable counting were found
+by trial and error, observing that:
+
+ + syllables tend to occur on the boundaries of consonants, vowels,
+   and 'separators'
+ + 'e' tends to be a special case
+
+#+name: Scanner-Declarations
+#+begin_src c :exports code
+typedef enum TxtState {
+  Txt_Start,
+  Txt_AIOUY,
+  Txt_Cons,
+  Txt_E,
+  Txt_Sep,
+  Txt_Count
+} TxtState;
+
+#+end_src
+
+Separators are defined whitespace, line feeds, EOF, and punctuation
+marks. Syllables are estimated according to the above rules, along
+with special cases found by trial and error (e.g., the -ism suffic
+comes up often enough to deserve its own condition).
+
+#+name: Scanner-Macros
+#+begin_src c :exports code
+#define AIOUY(l) ((l) == 'A'  || \
+		  (l) == 'I'  || \
+		  (l) == 'O'  || \
+		  (l) == 'U'  || \
+		  (l) == 'Y')
+#define E(l)     ((l) == 'E')
+#define TERM(l)  ((l) == '.'  || \
+		  (l) == '!'  || \
+		  (l) == '?')
+
+#define SEP(l)   ((l) == ','  || \
+		  (l) == '\0' || \
+		  SP(l)       || \
+		  NL(l)       || \
+		  TERM(l))
+
+#define SYLEDGE(c, state, next) ((state == Txt_AIOUY && next == Txt_Cons) || \
+				 (state == Txt_AIOUY && next == Txt_Sep)  || \
+				 (state == Txt_E     && next == Txt_Cons) || \
+				 (state == Txt_Cons && c == 'M'))
+
+#define WORDEDGE(c, state, next) (state != Txt_Start && \
+				  state != Txt_Sep   &&	\
+				  next == Txt_Sep)
+
+#define SENTEDGE(c, state, next) (TERM(c) && s != Txt_Sep)
+
+#+end_src
+
+
+The text scanner proceeds a character at a time through the input
+text, keeping a buffer for the current word being scanned, as well as
+an estimated syllable count. This allows the estimate to be updated in
+the event it's found in the dictionary. 
+
+#+name: Scanner-Includes
+#+begin_src c :exports code
+#include <ctype.h> /* toupper */
+#+end_src
+
+#+name: Scanner-Text-Scanner
+#+begin_src c :exports code
+void
+parsetxt(FILE *fp,
+	unsigned int *sents,
+	unsigned int *words,
+	unsigned int *syls,
+	struct table *dic) {
+	       
+  TxtState s, snext;
+  unsigned int wi, sylcnt;
+  char c, wordbuf[WORDSIZE] = {'\0'};
+  struct entry *e;
+  
+  s = Txt_Start;
+  wi = sylcnt = 0;
+  e = NULL;
+  
+  while(1) {
+    c = toupper(fgetc(fp));
+    
+    if      (AIOUY(c)) { snext = Txt_AIOUY; }
+    else if (E(c))     { snext = Txt_E;     }
+    else if (SEP(c))   { snext = Txt_Sep;   }
+    else               { snext = Txt_Cons;  }
+
+    if(snext != Txt_Sep) wordbuf[wi++] = c;
+
+    /* side effects */
+
+    if(SYLEDGE(c, s, snext)) {
+      sylcnt++;
+      }
+
+    if(WORDEDGE(c, s, snext)) {
+      (*words)++;  
+      wordbuf[wi] ='\0';
+      wi = 0;
+
+      /* maybe update syllable estimate */
+      if(dic != NULL) {
+	table_get(dic, wordbuf, &e);
+	if(e != NULL) {
+	  sylcnt = entry_value_get(e);
+	}
+      }
+      e = NULL;
+      
+      *syls = *syls + sylcnt;
+      sylcnt = 0;
+    }
+          
+    if(SENTEDGE(c, s, next)) {
+      (*sents)++;
+    }
+    
+    if(c == '\0' || c == EOF) break;
+
+    s = snext;
+  }
+
+}
+#+end_src
+
+This concludes the core of /rdabl's/ logic.
+
+* Building the Shared Library
+
+I'll opt to expose calculation procedures in a shared library. This
+isn't strictly necessary, but leaves open the possibility of reusing
+the logic for other use cases, or providing alternative frontends
+down the road.
+
+#+name: Makefile-Target-Variables
+#+begin_src makefile :exports code 
+lib = $(libdir)/lib$(prog).so
+libsrc=$(srcdir)/table.c $(srcdir)/scan.c
+#+end_src
+
+#+name: Makefile-Real-Targets
+#+begin_src makefile :exports code 
+
+$(lib): $(libsrc)
+	mkdir -p $(libdir)
+	$(cc) $(cflags) -o $@ $^ -shared -fPIC
+
+#+end_src
+
+* Public Interface
+
+/rdabl's/ top-level is isolated to a single single source file.
+
+#+name: rdabl
+#+begin_src c :exports code :noweb tangle :tangle src/rdabl.c :mkdirp yes
+<<rdabl-Includes>>
+
+<<rdabl-Macros>>
+
+<<rdabl-Declarations>>
+
+<<rdabl-Definitions>>
+
+#+end_src
+
+It exposes a simple POSIX-based command interface, taking an optional
+dictionary file argument and an input file provided as the
+last input argument (or stdin otherwise): 
+
+#+name: rdabl-Declarations
+#+begin_src c :exports code 
+
+static void
+usage(const char *);
+
+#+end_src
+
+
+#+name: rdabl-Definitions
+#+begin_src c :exports code 
+
+static void
+usage(const char *prog) {
+  fprintf(stderr, "Usage: %s [-d dic] [text]\n", prog);
+}
+
+#+end_src
+
+rdabl's output should be textual descriptions of the Flesh-Kinclaid
+Readability Index for the given input text. 
+
+#+name: rdabl-Declarations
+#+begin_src c :exports code
+
+static void
+prscore(FILE *fp,
+	unsigned int sents,
+	unsigned int words,
+	unsigned int syls);
+
+#+end_src
+
+#+name: rdabl-Macros
+#+begin_src c :exports code
+
+#define MAX(a,b) (((a)>(b))?(a):(b))
+
+#+end_src
+
+
+#+name: rdabl-Definitions
+#+begin_src c :exports code
+
+static void
+prscore(FILE *fp,
+	unsigned int sents,
+	unsigned int words,
+	unsigned int syls) {
+  
+  float score = 206.835 -	   \
+    1.015 * (words/(float)MAX(sents,1)) -	\
+    84.6 * (syls/(float)MAX(words,1));
+
+  const char *fmt = "%d %d %d %.2f\n%s\n";
+      
+  if      (score >= 90.0)
+    fprintf(fp, fmt, sents, words, syls, score,			\
+	    "Very easy to read. Easily understood by an average 11-year-old student.");
+  else if (score >= 80.0)
+    fprintf(fp, fmt, sents, words, syls, score,			\
+	    "Easy to read. Conversational English for consumers.");
+  else if (score >= 70.0)
+    fprintf(fp, fmt, sents, words, syls, score,			\
+	    "Fairly easy to read.");
+  else if (score >= 60.0)
+    fprintf(fp, fmt, sents, words, syls, score, 		\
+	    "Plain English. Easily understood by 13- to 15-year-old students.");
+  else if (score >= 50.0)
+    fprintf(fp, fmt, sents, words, syls, score,			\
+	    "Fairly difficult to read.");
+  else if (score >= 30.0)
+    fprintf(fp, fmt, sents, words, syls, score,			\
+	    "Difficult to read.");
+  else if (score >= 0.0)
+    fprintf(fp, fmt, sents, words, syls, score,			\
+	    "Very difficult to read. Best understood by university graduates.");
+  else
+    fprintf(fp, fmt, sents, words, syls, score,			\
+	    "Score outside classifiable range. I don't even know how to begin reading this.");        
+}
+
+#+end_src
+
+Finally, it's time to set up rdabl's entry point. Just a few notes on
+this section:
+ + I opted to use POSIX getopt over a homemade flag processor. It's
+   simpler to read and POSIX support is a dependency I've already
+   assumed.
+ + The input files' size is used to approximate the number of buckets
+   in each symbol table (i.e., st_size >> 3). In testing, this
+   providing a good approximation for near constant lookups. This
+   approach may need refinement if /rdabl/ is used in
+   memory-constrained environments.
+
+#+name: rdabl-Includes
+#+begin_src c :exports code
+
+#include <stdio.h>    /* fprintf */
+#include <stdlib.h>   /* exit    */
+#include <unistd.h>   /* getopt  */
+#include <sys/stat.h> /* stat    */
+
+#include "table.h"
+#include "scan.h"
+
+#+end_src
+
+#+name: rdabl-Definitions
+#+begin_src c :exports code
+
+int
+main(int argc, char *argv[]) {
+  int opt;
+  FILE *df, *cf;
+  struct stat st;
+  struct table *dic, *corpus;
+  tablestatus ds, cs;
+  unsigned int sents, words, syls;
+
+
+  sents = words = syls = 0;
+  df = NULL, cf = stdin;
+  dic = NULL, corpus = NULL;
+  ds = FAIL_UNKNOWN, cs = FAIL_UNKNOWN;
+  
+   
+  while((opt = getopt(argc, argv, "d:h")) != -1) {
+    switch (opt) {
+    case 'd':
+
+      if((df = fopen(optarg, "r")) == NULL) {
+	fprintf(stderr, "%s: Failed to open dictionary file '%s'.\n", argv[0], optarg);
+	goto bye;
+      }
+
+      stat(optarg, &st);
+      if((ds = table_create(&dic, st.st_size >> 3)) != SUCCESS) {
+	fprintf(stderr, "%s: Unable to set up table for dictionary. \
+                        This could mean insufficient memory...or a bug.\n", argv[0]);		
+	goto bye;
+      }
+
+      parsedic(df, dic);
+      break;
+
+    case 'h':
+      usage(argv[0]);
+      goto bye;
+      break;
+
+    default:
+      goto bye;
+    }
+  }
+
+
+  if((optind < argc) && (cf = fopen(argv[optind], "r")) == NULL) {
+      fprintf(stderr, "%s: Failed to open corpus file '%s'.\n", argv[0], argv[optind]);
+      goto bye;
+  }
+
+  stat(argv[optind], &st);
+  if((cs = table_create(&corpus, st.st_size >> 3)) != SUCCESS) {
+      fprintf(stderr, "%s: Unable to set up table for corpus. \
+                       This could mean insufficient memory...or a bug.", argv[0]);
+      goto bye;
+  }
+
+  
+  parsetxt(cf, &sents, &words, &syls, dic);
+  
+  prscore(stdout, sents, words, syls);
+  
+ bye:  
+  if(df)     { fclose(df); }
+  if(cf)     { fclose(cf); }
+  if(dic)    { table_free(dic); }
+  if(corpus) { table_free(corpus); }
+  exit(((ds == SUCCESS)  && (cs == SUCCESS)) ?
+       EXIT_SUCCESS : EXIT_FAILURE);
+  
+}
+
+#+end_src
+
+To finish things off, add the top-level compilation unit to the
+Makefile.
+
+#+name: Makefile-Target-Variables
+#+begin_src makefile :exports code 
+exe=$(bindir)/$(prog)
+#+end_src
+
+#+name: Makefile-Real-Targets
+#+begin_src makefile :exports code 
+$(exe): $(srcdir)/rdabl.c $(lib)
+	mkdir -p $(bindir)
+	$(cc) $(cflags) -L$(libdir) -o $@ $< -l$(prog)
+#+end_src
+
+#+name: Makefile-All
+#+begin_src makefile :exports code 
+$(exe) 
+#+end_src
+
+** Install, Uninstall, Demo, and Cleaning Procedures
+
+I'll keep the install procedure simple: set the folder prefix for
+installation, assuming a Unix-like directory tree, and place
+binaries and shared objects in the usual places.
+
+#+name: Makefile-Tooling-Variables
+#+begin_src makefile :exports code
+prefix=/usr/local
+#+end_src
+
+#+name: Makefile-Phony-Targets
+#+begin_src makefile :exports code
+.PHONY: install
+install:
+	cp $(lib) $(prefix)/lib
+	cp $(exe) $(prefix)/bin
+
+.PHONY: uninstall
+uninstall:
+	rm $(prefix)/lib/lib$(prog).so
+	rm $(prefix)/bin/$(prog)
+#+end_src
+
+It's important to have a bit of hygiene. 
+
+#+name: Makefile-Phony-Targets
+#+begin_src makefile :exports code
+.PHONY: clean
+clean:
+	rm -rf $(bindir) $(incdir) $(libdir) $(srcdir) $(txtdir) Makefile *.LICENSE
+
+.PHONY: leaks
+leaks:
+	valgrind --track-origins=yes ./$(bindir)/$(prog) \
+		 -d $(txtdir)/sample_dic $(txtdir)/sample.txt
+
+.PHONY: check
+check: $(tstexe)
+	./$(tstexe)
+
+#+end_src
+
+And it's worth showing off what rdabl can do, like measuring the
+readability of a Wikipedia excerpt on the Empire State Building.
+
+#+name: Makefile-Phony-Targets
+#+begin_src makefile :exports code
+.PHONY: demo
+demo: $(exe)
+	@./$(exe) -d $(txtdir)/sample_dic $(txtdir)/sample.txt
+#+end_src
+
+#+name: Sample Text
+#+begin_src text :exports code :tangle txt/sample.txt :mkdirp yes
+The site of the Empire State Building, located on the west side of
+Fifth Avenue between West 33rd and 34th Streets, was originally part
+of an early 18th century farm. In the late 1820s, it came into the
+possession of the prominent Astor family, with John Jacob Astor's
+descendants building the Waldorf–Astoria Hotel on the site in the
+1890s. By the 1920s, the family had sold the outdated hotel and the
+site indirectly ended up under the ownership of Empire State Inc., a
+business venture that included businessman John J. Raskob and former
+New York governor Al Smith. The original design of the Empire State
+Building was for a 50-story office building. However, after fifteen
+revisions, the final design was for a 86-story 1,250-foot building,
+with an airship mast on top. This ensured it would be the world's
+tallest building, beating the Chrysler Building and 40 Wall Street,
+two other Manhattan skyscrapers under construction at the time that
+were also vying for that distinction.
+#+end_src
+
+It is surprising how many texts, including Wikipedia articles, excerpts
+from the The Atlantic, and portions of this document, are classified
+as 'difficult to read' under Flesch-Kinclaid. Even some Hemingway
+paragraphs, carefully chosen, are classified as 'graduate
+level'. 
+
+* Tests
+
+To test the behavior of rdabl, I've added some unit tests
+(built against CuTest for no other reason than it's 
+lightweight). Source for test files will have a *_test.c suffix by
+convention. The tests will be compiled to a separate executable.
+
+#+name: Makefile-Target-Variables
+#+begin_src makefile :exports code
+tstexe=$(bindir)/test$(prog)
+tstsrc=$(srcdir)/*test.c $(srcdir)/CuTest.c
+#+end_src
+
+The test suite will be built as its own executable. The dictionary and
+input text will be statically allocated and accessed at runtime with
+/fmemopen/. 
+#+name: Makefile-Real-Targets
+#+begin_src makefile :exports code
+$(srcdir)/sample_dic_test.c: $(txtdir)/sample_dic
+	xxd -i $< > $@
+
+$(srcdir)/sample_test.c: $(txtdir)/sample.txt
+	xxd -i $< | sed s/txt_sample_txt/sample_txt/g > $@
+
+$(tstexe): $(tstsrc) $(srcdir)/sample_dic_test.c $(srcdir)/sample_test.c
+	$(cc) $(cflags) -L$(libdir) -o $@ $^ -l$(prog)
+#+end_src
+
+#+name: Makefile-All
+#+begin_src makefile :exports code
+$(tstexe)
+#+end_src
+
+
+#+name: rdable-test
+#+begin_src c :exports code :noweb tangle :tangle src/rdabl_test.c 
+#include <stdio.h>
+#include "CuTest.h"
+
+<<Test-Includes>>
+
+<<Test-Macros>>
+
+<<Test-Declarations>>
+
+void testall(void) {
+  CuString *output = CuStringNew();
+  CuSuite* suite = CuSuiteNew();
+
+  <<Test-Suites>>
+  
+  CuSuiteRun(suite);
+  CuSuiteSummary(suite, output);
+  CuSuiteDetails(suite, output);
+
+  printf("%s\n", output->buffer);
+
+  CuStringDelete(output);
+  CuSuiteDelete(suite);
+}
+
+
+int
+main(int argc, char *argv[]) {
+  testall();
+}
+#+end_src
+
+
+** Testing the Symbol Table 
+#+name: Test-Declarations
+#+begin_src c :exports code
+extern CuSuite *test_table_create(void);
+#+end_src
+
+
+#+name: Test-Suites
+#+begin_src c :exports code
+CuSuiteAddSuite(suite, test_table_create());
+#+end_src
+
+#+name: table-test
+#+begin_src c :exports code :tangle src/table_test.c :mkdirp yes
+
+#include <stdio.h> /* CuTest macros use NULL */
+
+#include "table.h"
+#include "CuTest.h"
+
+/* ensure SUCCESS status on found word */
+static void
+test_table_add_status(CuTest *tc) {  
+  tablestatus s;
+  struct table *t;
+  struct entry *e;
+
+  char *word = "barbledegook";
+  table_create(&t, 32);
+  table_add(t, word, 0);
+  s = table_get(t, word, &e);
+  CuAssertIntEquals(tc, s, SUCCESS);
+  table_free(t);
+
+}
+
+/* ensure FAIL_MISSING status on missing word */
+static void
+test_table_missing_status(CuTest *tc) {
+  tablestatus s;
+  struct table *t;
+  struct entry *e;
+  char *in;
+
+  in= "barbledegook";
+  table_create(&t, 32);
+  s = table_get(t, in, &e);
+  CuAssertIntEquals(tc, FAIL_MISSING, s);
+  table_free(t);
+}
+
+/* ensure added entry has correct fields */
+static void
+test_table_add(CuTest *tc) {
+  tablestatus s;
+  struct table *t;
+  struct entry *e;
+  char *in;
+  int value;
+
+  in = "entrye";
+  value = 1024UL;  
+  table_create(&t, 32);
+  s = table_add(t, in, value);
+  s = table_get(t, in, &e);
+  
+  CuAssertIntEquals(tc, SUCCESS, s);
+  CuAssertStrEquals(tc, in, entry_word(e));
+  CuAssertIntEquals(tc, value, entry_value_get(e));
+
+  table_free(t);
+}
+
+/* ensure multiple adds increments occurrence count */
+static void
+test_table_occurrences(CuTest *tc) {
+  tablestatus s;
+  struct table *t;
+  struct entry *e;
+  char *in;
+  int i, count, value;
+  
+  in = "entrye";
+  count = 8, value = 100;
+  
+  table_create(&t, 32);
+  for(i = 0; i < count; i++) {
+      s = table_add(t, in, value);
+  }  
+  s = table_get(t, in, &e);
+  
+  CuAssertIntEquals(tc, SUCCESS, s);
+  CuAssertStrEquals(tc, in, entry_word(e));
+  CuAssertIntEquals(tc, value, entry_value_get(e));
+
+  table_free(t);
+
+}
+ 
+
+CuSuite *test_table_create() {
+  CuSuite *suite = CuSuiteNew();
+  SUITE_ADD_TEST(suite, test_table_add_status);
+  SUITE_ADD_TEST(suite, test_table_missing_status);
+  SUITE_ADD_TEST(suite, test_table_add);
+  SUITE_ADD_TEST(suite, test_table_occurrences);
+  return suite;
+}
+
+#+end_src
+
+** Testing The Scanner
+#+name: Test-Declarations
+#+begin_src c :exports code
+extern CuSuite *test_scan_create(void);
+#+end_src
+
+
+#+name: Test-Suites
+#+begin_src c :exports code
+CuSuiteAddSuite(suite, test_scan_create());
+#+end_src
+
+#+name: scan-test
+#+begin_src c :exports code :tangle src/scan_test.c :mkdirp yes
+
+#include <stdio.h> /* fopen, CuTest macros use NULL */
+
+#include "CuTest.h"
+
+#include "table.h"
+#include "scan.h"
+
+extern char sample_txt[];
+extern int  sample_txt_len;
+
+extern char txt_sample_dic[];
+extern int  txt_sample_dic_len;
+
+extern char txt_dicwords[];
+extern char txt_dicwords_len;
+
+static void
+table_count(struct entry *e, void *acc) {
+  (*((int *)(acc)))++;
+}
+
+static void
+test_parsedic_expected_words(CuTest *tc) {
+  FILE *dic;
+  struct table *t;
+  struct entry *e;
+
+  dic = NULL;
+  unsigned int acc = 0;
+
+  table_create(&t, 1000L);
+  dic = fmemopen(txt_sample_dic, txt_sample_dic_len, "r");
+  CuAssertPtrNotNullMsg(tc, "Sample dictionary not found", dic);
+  parsedic(dic, t);
+  table_each(t, table_count, (void *)(&acc));
+  CuAssertIntEquals_Msg(tc, "Expected different number of dictionary entries", acc, 123892);
+
+  /* sampling of words */
+  table_get(t, "ZOLP", &e);
+  CuAssertStrEquals_Msg(tc, "Expected word 'ZOLP'", "ZOLP", entry_word(e));
+
+  table_get(t, "AARON'S", &e);
+  CuAssertStrEquals_Msg(tc, "Expected word \"AARON\'", "AARON'S", entry_word(e));
+  fclose(dic);
+  table_free(t);
+}
+
+static void
+test_parsetxt_without_dic(CuTest *tc) {
+  FILE *txt;
+  unsigned int sents, words, syls;
+
+  sents = words = syls = 0;
+  txt = fmemopen(sample_txt, sample_txt_len, "r");
+  CuAssertPtrNotNullMsg(tc, "Sample text not found", txt);
+
+  parsetxt(txt, &sents, &words, &syls, NULL);
+  printf("%d %d %d\n", sents, words, syls);
+  fclose(txt);
+}
+
+
+static void
+test_parsetxt_with_dic(CuTest *tc) {
+  FILE *txt, *dic;
+  struct table *t;
+  
+  unsigned int sents, words, syls;
+
+  txt = dic = NULL;
+  sents = words = syls = 0;
+
+  table_create(&t, 10000L);
+
+  
+  txt = fmemopen(sample_txt, sample_txt_len, "r");
+  CuAssertPtrNotNullMsg(tc, "Sample text not found", txt);
+
+  dic = fmemopen(txt_sample_dic, txt_sample_dic_len, "r");
+  CuAssertPtrNotNullMsg(tc, "Sample dicionary not found", txt);
+
+  parsedic(dic, t);
+  parsetxt(txt, &sents, &words, &syls, t);
+  printf("%d %d %d\n", sents, words, syls);
+  fclose(txt);
+  fclose(dic);
+  table_free(t);
+}
+
+
+CuSuite *
+test_scan_create() {
+  CuSuite *suite = CuSuiteNew();
+  SUITE_ADD_TEST(suite, test_parsedic_expected_words);
+  SUITE_ADD_TEST(suite, test_parsetxt_without_dic);
+  SUITE_ADD_TEST(suite, test_parsetxt_with_dic);  
+  return suite;
+}
+
+#+end_src
+
+
+
+** CuTest 
+
+#+name: CuTest Header
+#+begin_src c :exports code :tangle inc/CuTest.h :mkdirp yes
+#ifndef CU_TEST_H
+#define CU_TEST_H
+
+#include <setjmp.h>
+#include <stdarg.h>
+
+#define CUTEST_VERSION  "CuTest 1.5b"
+
+/* CuString */
+
+char* CuStrAlloc(int size);
+char* CuStrCopy(const char* old);
+
+#define CU_ALLOC(TYPE)		((TYPE*) malloc(sizeof(TYPE)))
+
+#define HUGE_STRING_LEN	8192
+#define STRING_MAX		256
+#define STRING_INC		256
+
+typedef struct
+{
+	int length;
+	int size;
+	char* buffer;
+} CuString;
+
+void CuStringInit(CuString* str);
+CuString* CuStringNew(void);
+void CuStringRead(CuString* str, const char* path);
+void CuStringAppend(CuString* str, const char* text);
+void CuStringAppendChar(CuString* str, char ch);
+void CuStringAppendFormat(CuString* str, const char* format, ...);
+void CuStringInsert(CuString* str, const char* text, int pos);
+void CuStringResize(CuString* str, int newSize);
+void CuStringDelete(CuString* str);
+
+/* CuTest */
+
+typedef struct CuTest CuTest;
+
+typedef void (*TestFunction)(CuTest *);
+
+struct CuTest
+{
+	char* name;
+	TestFunction function;
+	int failed;
+	int ran;
+	CuString *message;
+	jmp_buf *jumpBuf;
+};
+
+void CuTestInit(CuTest* t, const char* name, TestFunction function);
+CuTest* CuTestNew(const char* name, TestFunction function);
+void CuTestRun(CuTest* tc);
+void CuTestDelete(CuTest *t);
+
+/* Internal versions of assert functions -- use the public versions */
+void CuFail_Line(CuTest* tc, const char* file, int line, const char* message2, const char* message);
+void CuAssert_Line(CuTest* tc, const char* file, int line, const char* message, int condition);
+void CuAssertStrEquals_LineMsg(CuTest* tc, 
+	const char* file, int line, const char* message, 
+	const char* expected, const char* actual);
+void CuAssertIntEquals_LineMsg(CuTest* tc, 
+	const char* file, int line, const char* message, 
+	int expected, int actual);
+void CuAssertDblEquals_LineMsg(CuTest* tc, 
+	const char* file, int line, const char* message, 
+	double expected, double actual, double delta);
+void CuAssertPtrEquals_LineMsg(CuTest* tc, 
+	const char* file, int line, const char* message, 
+	void* expected, void* actual);
+
+/* public assert functions */
+
+#define CuFail(tc, ms)                        CuFail_Line(  (tc), __FILE__, __LINE__, NULL, (ms))
+#define CuAssert(tc, ms, cond)                CuAssert_Line((tc), __FILE__, __LINE__, (ms), (cond))
+#define CuAssertTrue(tc, cond)                CuAssert_Line((tc), __FILE__, __LINE__, "assert failed", (cond))
+
+#define CuAssertStrEquals(tc,ex,ac)           CuAssertStrEquals_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac))
+#define CuAssertStrEquals_Msg(tc,ms,ex,ac)    CuAssertStrEquals_LineMsg((tc),__FILE__,__LINE__,(ms),(ex),(ac))
+#define CuAssertIntEquals(tc,ex,ac)           CuAssertIntEquals_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac))
+#define CuAssertIntEquals_Msg(tc,ms,ex,ac)    CuAssertIntEquals_LineMsg((tc),__FILE__,__LINE__,(ms),(ex),(ac))
+#define CuAssertDblEquals(tc,ex,ac,dl)        CuAssertDblEquals_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac),(dl))
+#define CuAssertDblEquals_Msg(tc,ms,ex,ac,dl) CuAssertDblEquals_LineMsg((tc),__FILE__,__LINE__,(ms),(ex),(ac),(dl))
+#define CuAssertPtrEquals(tc,ex,ac)           CuAssertPtrEquals_LineMsg((tc),__FILE__,__LINE__,NULL,(ex),(ac))
+#define CuAssertPtrEquals_Msg(tc,ms,ex,ac)    CuAssertPtrEquals_LineMsg((tc),__FILE__,__LINE__,(ms),(ex),(ac))
+
+#define CuAssertPtrNotNull(tc,p)        CuAssert_Line((tc),__FILE__,__LINE__,"null pointer unexpected",((p) != NULL))
+#define CuAssertPtrNotNullMsg(tc,msg,p) CuAssert_Line((tc),__FILE__,__LINE__,(msg),((p) != NULL))
+
+/* CuSuite */
+
+#define MAX_TEST_CASES	1024
+
+#define SUITE_ADD_TEST(SUITE,TEST)	CuSuiteAdd(SUITE, CuTestNew(#TEST, TEST))
+
+typedef struct
+{
+	int count;
+	CuTest* list[MAX_TEST_CASES];
+	int failCount;
+
+} CuSuite;
+
+
+void CuSuiteInit(CuSuite* testSuite);
+CuSuite* CuSuiteNew(void);
+void CuSuiteDelete(CuSuite *testSuite);
+void CuSuiteAdd(CuSuite* testSuite, CuTest *testCase);
+void CuSuiteAddSuite(CuSuite* testSuite, CuSuite* testSuite2);
+void CuSuiteRun(CuSuite* testSuite);
+void CuSuiteSummary(CuSuite* testSuite, CuString* summary);
+void CuSuiteDetails(CuSuite* testSuite, CuString* details);
+
+#endif /* CU_TEST_H */
+
+#+end_src
+
+
+#+name: CuTest Source
+#+begin_src c :exports code :tangle src/CuTest.c :mkdirp yes
+#include <assert.h>
+#include <setjmp.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+#include "CuTest.h"
+
+/*-------------------------------------------------------------------------*
+ * CuStr
+ *-------------------------------------------------------------------------*/
+
+char* CuStrAlloc(int size)
+{
+	char* newStr = (char*) malloc( sizeof(char) * (size) );
+	return newStr;
+}
+
+char* CuStrCopy(const char* old)
+{
+	int len = strlen(old);
+	char* newStr = CuStrAlloc(len + 1);
+	strcpy(newStr, old);
+	return newStr;
+}
+
+/*-------------------------------------------------------------------------*
+ * CuString
+ *-------------------------------------------------------------------------*/
+
+void CuStringInit(CuString* str)
+{
+	str->length = 0;
+	str->size = STRING_MAX;
+	str->buffer = (char*) malloc(sizeof(char) * str->size);
+	str->buffer[0] = '\0';
+}
+
+CuString* CuStringNew(void)
+{
+	CuString* str = (CuString*) malloc(sizeof(CuString));
+	str->length = 0;
+	str->size = STRING_MAX;
+	str->buffer = (char*) malloc(sizeof(char) * str->size);
+	str->buffer[0] = '\0';
+	return str;
+}
+
+void CuStringDelete(CuString *str)
+{
+        if (!str) return;
+        free(str->buffer);
+        free(str);
+}
+
+void CuStringResize(CuString* str, int newSize)
+{
+	str->buffer = (char*) realloc(str->buffer, sizeof(char) * newSize);
+	str->size = newSize;
+}
+
+void CuStringAppend(CuString* str, const char* text)
+{
+	int length;
+
+	if (text == NULL) {
+		text = "NULL";
+	}
+
+	length = strlen(text);
+	if (str->length + length + 1 >= str->size)
+		CuStringResize(str, str->length + length + 1 + STRING_INC);
+	str->length += length;
+	strcat(str->buffer, text);
+}
+
+void CuStringAppendChar(CuString* str, char ch)
+{
+	char text[2];
+	text[0] = ch;
+	text[1] = '\0';
+	CuStringAppend(str, text);
+}
+
+void CuStringAppendFormat(CuString* str, const char* format, ...)
+{
+	va_list argp;
+	char buf[HUGE_STRING_LEN];
+	va_start(argp, format);
+	vsprintf(buf, format, argp);
+	va_end(argp);
+	CuStringAppend(str, buf);
+}
+
+void CuStringInsert(CuString* str, const char* text, int pos)
+{
+	int length = strlen(text);
+	if (pos > str->length)
+		pos = str->length;
+	if (str->length + length + 1 >= str->size)
+		CuStringResize(str, str->length + length + 1 + STRING_INC);
+	memmove(str->buffer + pos + length, str->buffer + pos, (str->length - pos) + 1);
+	str->length += length;
+	memcpy(str->buffer + pos, text, length);
+}
+
+/*-------------------------------------------------------------------------*
+ * CuTest
+ *-------------------------------------------------------------------------*/
+
+void CuTestInit(CuTest* t, const char* name, TestFunction function)
+{
+	t->name = CuStrCopy(name);
+	t->failed = 0;
+	t->ran = 0;
+        t->message = NULL;
+	t->function = function;
+	t->jumpBuf = NULL;
+}
+
+CuTest* CuTestNew(const char* name, TestFunction function)
+{
+	CuTest* tc = CU_ALLOC(CuTest);
+	CuTestInit(tc, name, function);
+	return tc;
+}
+
+void CuTestDelete(CuTest *t)
+{
+        if (!t) return;
+        CuStringDelete(t->message);
+        free(t->name);
+        free(t);
+}
+
+void CuTestRun(CuTest* tc)
+{
+	jmp_buf buf;
+	tc->jumpBuf = &buf;
+	if (setjmp(buf) == 0)
+	{
+		tc->ran = 1;
+		(tc->function)(tc);
+	}
+	tc->jumpBuf = 0;
+}
+
+static void CuFailInternal(CuTest* tc, const char* file, int line, CuString* string)
+{
+	char buf[HUGE_STRING_LEN];
+
+	sprintf(buf, "%s:%d: ", file, line);
+	CuStringInsert(string, buf, 0);
+
+	tc->failed = 1;
+        free(tc->message);
+        tc->message = CuStringNew();
+        CuStringAppend(tc->message, string->buffer);
+	if (tc->jumpBuf != 0) longjmp(*(tc->jumpBuf), 0);
+}
+
+void CuFail_Line(CuTest* tc, const char* file, int line, const char* message2, const char* message)
+{
+	CuString string;
+
+	CuStringInit(&string);
+	if (message2 != NULL) 
+	{
+		CuStringAppend(&string, message2);
+		CuStringAppend(&string, ": ");
+	}
+	CuStringAppend(&string, message);
+	CuFailInternal(tc, file, line, &string);
+}
+
+void CuAssert_Line(CuTest* tc, const char* file, int line, const char* message, int condition)
+{
+	if (condition) return;
+	CuFail_Line(tc, file, line, NULL, message);
+}
+
+void CuAssertStrEquals_LineMsg(CuTest* tc, const char* file, int line, const char* message, 
+	const char* expected, const char* actual)
+{
+	CuString string;
+	if ((expected == NULL && actual == NULL) ||
+	    (expected != NULL && actual != NULL &&
+	     strcmp(expected, actual) == 0))
+	{
+		return;
+	}
+
+	CuStringInit(&string);
+	if (message != NULL) 
+	{
+		CuStringAppend(&string, message);
+		CuStringAppend(&string, ": ");
+	}
+	CuStringAppend(&string, "expected <");
+	CuStringAppend(&string, expected);
+	CuStringAppend(&string, "> but was <");
+	CuStringAppend(&string, actual);
+	CuStringAppend(&string, ">");
+	CuFailInternal(tc, file, line, &string);
+}
+
+void CuAssertIntEquals_LineMsg(CuTest* tc, const char* file, int line, const char* message, 
+	int expected, int actual)
+{
+	char buf[STRING_MAX];
+	if (expected == actual) return;
+	sprintf(buf, "expected <%d> but was <%d>", expected, actual);
+	CuFail_Line(tc, file, line, message, buf);
+}
+
+void CuAssertDblEquals_LineMsg(CuTest* tc, const char* file, int line, const char* message, 
+	double expected, double actual, double delta)
+{
+	char buf[STRING_MAX];
+	if (fabs(expected - actual) <= delta) return;
+	sprintf(buf, "expected <%f> but was <%f>", expected, actual); 
+
+	CuFail_Line(tc, file, line, message, buf);
+}
+
+void CuAssertPtrEquals_LineMsg(CuTest* tc, const char* file, int line, const char* message, 
+	void* expected, void* actual)
+{
+	char buf[STRING_MAX];
+	if (expected == actual) return;
+	sprintf(buf, "expected pointer <0x%p> but was <0x%p>", expected, actual);
+	CuFail_Line(tc, file, line, message, buf);
+}
+
+
+/*-------------------------------------------------------------------------*
+ * CuSuite
+ *-------------------------------------------------------------------------*/
+
+void CuSuiteInit(CuSuite* testSuite)
+{
+	testSuite->count = 0;
+	testSuite->failCount = 0;
+        memset(testSuite->list, 0, sizeof(testSuite->list));
+}
+
+CuSuite* CuSuiteNew(void)
+{
+	CuSuite* testSuite = CU_ALLOC(CuSuite);
+	CuSuiteInit(testSuite);
+	return testSuite;
+}
+
+void CuSuiteDelete(CuSuite *testSuite)
+{
+        unsigned int n;
+        for (n=0; n < MAX_TEST_CASES; n++)
+        {
+                if (testSuite->list[n])
+                {
+                        CuTestDelete(testSuite->list[n]);
+                }
+        }
+        free(testSuite);
+
+}
+
+void CuSuiteAdd(CuSuite* testSuite, CuTest *testCase)
+{
+	assert(testSuite->count < MAX_TEST_CASES);
+	testSuite->list[testSuite->count] = testCase;
+	testSuite->count++;
+}
+
+void CuSuiteAddSuite(CuSuite* testSuite, CuSuite* testSuite2)
+{
+	int i;
+	for (i = 0 ; i < testSuite2->count ; ++i)
+	{
+		CuTest* testCase = testSuite2->list[i];
+		CuSuiteAdd(testSuite, testCase);
+	}
+}
+
+void CuSuiteRun(CuSuite* testSuite)
+{
+	int i;
+	for (i = 0 ; i < testSuite->count ; ++i)
+	{
+		CuTest* testCase = testSuite->list[i];
+		CuTestRun(testCase);
+		if (testCase->failed) { testSuite->failCount += 1; }
+	}
+}
+
+void CuSuiteSummary(CuSuite* testSuite, CuString* summary)
+{
+	int i;
+	for (i = 0 ; i < testSuite->count ; ++i)
+	{
+		CuTest* testCase = testSuite->list[i];
+		CuStringAppend(summary, testCase->failed ? "F" : ".");
+	}
+	CuStringAppend(summary, "\n\n");
+}
+
+void CuSuiteDetails(CuSuite* testSuite, CuString* details)
+{
+	int i;
+	int failCount = 0;
+
+	if (testSuite->failCount == 0)
+	{
+		int passCount = testSuite->count - testSuite->failCount;
+		const char* testWord = passCount == 1 ? "test" : "tests";
+		CuStringAppendFormat(details, "OK (%d %s)\n", passCount, testWord);
+	}
+	else
+	{
+		if (testSuite->failCount == 1)
+			CuStringAppend(details, "There was 1 failure:\n");
+		else
+			CuStringAppendFormat(details, "There were %d failures:\n", testSuite->failCount);
+
+		for (i = 0 ; i < testSuite->count ; ++i)
+		{
+			CuTest* testCase = testSuite->list[i];
+			if (testCase->failed)
+			{
+				failCount++;
+				CuStringAppendFormat(details, "%d) %s: %s\n",
+					failCount, testCase->name, testCase->message->buffer);
+			}
+		}
+		CuStringAppend(details, "\n!!!FAILURES!!!\n");
+
+		CuStringAppendFormat(details, "Runs: %d ",   testSuite->count);
+		CuStringAppendFormat(details, "Passes: %d ", testSuite->count - testSuite->failCount);
+		CuStringAppendFormat(details, "Fails: %d\n",  testSuite->failCount);
+	}
+}
+
+#+end_src
+* Development
+
+/rdabl/'s sources can be built entirely from this file. Within an
+[[https://orgmode.org/][org-enabled]] Emacs on a modern *nix system, load this file in a buffer,
+then execute ~M-x org-babel-tangle~ followed by ~make~. 
+
+* Licenses
+
+/rdbl/ itself is licensed under [[https://www.gnu.org/licenses/gpl-3.0.txt][GPLv3]].
+
+The included CMU Dictionary and CuTest test framework are covered
+under their own terms.
+
+#+name: CuTest-License
+#+begin_src text :exports code :tangle CuT.LICENSE
+Copyright (c) 2003 Asim Jalis
+
+This software is provided 'as-is', without any express or implied
+warranty. In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+claim that you wrote the original software. If you use this software in
+a product, an acknowledgment in the product documentation would be
+appreciated but is not required.
+
+2. Altered source versions must be plainly marked as such, and must not
+be misrepresented as being the original software.
+
+3. This notice may not be removed or altered from any source
+distribution.
+#+end_src
+
+#+name: CMU-License
+#+begin_src text :exports code :tangle CMU.LICENSE
+;;; # ========================================================================
+;;; # Copyright (C) 1993-2015 Carnegie Mellon University. All rights reserved.
+;;; #
+;;; # Redistribution and use in source and binary forms, with or without
+;;; # modification, are permitted provided that the following conditions
+;;; # are met:
+;;; #
+;;; # 1. Redistributions of source code must retain the above copyright
+;;; #    notice, this list of conditions and the following disclaimer.
+;;; #    The contents of this file are deemed to be source code.
+;;; #
+;;; # 2. Redistributions in binary form must reproduce the above copyright
+;;; #    notice, this list of conditions and the following disclaimer in
+;;; #    the documentation and/or other materials provided with the
+;;; #    distribution.
+;;; #
+;;; # This work was supported in part by funding from the Defense Advanced
+;;; # Research Projects Agency, the Office of Naval Research and the National
+;;; # Science Foundation of the United States of America, and by member
+;;; # companies of the Carnegie Mellon Sphinx Speech Consortium. We acknowledge
+;;; # the contributions of many volunteers to the expansion and improvement of
+;;; # this dictionary.
+;;; #
+;;; # THIS SOFTWARE IS PROVIDED BY CARNEGIE MELLON UNIVERSITY ``AS IS'' AND
+;;; # ANY EXPRESSED OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+;;; # THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+;;; # PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL CARNEGIE MELLON UNIVERSITY
+;;; # NOR ITS EMPLOYEES BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+;;; # SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+;;; # LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+;;; # DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+;;; # THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+;;; # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+;;; # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+;;; #
+;;; # ========================================================================
+#+end_src
