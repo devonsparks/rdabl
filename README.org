@@ -1,5 +1,6 @@
 #+TITLE: rdabl: A readability calculator for English ASCII text
 #+AUTHOR: Devon Sparks
+#+STARTUP: showeverything
 
 * Introduction
 
@@ -20,7 +21,7 @@ Of the well-known algorithms, I targeted the [[https://en.wikipedia.org/wiki/Fle
 Readability Index]] for implementation because:
 - it's been field tested enough to have a [[https://en.wikipedia.org/wiki/United_States_Military_Standard][MilSpec]]
 - it only requires the calculation of total sentences, words, and
-syllables on the input text. 
+  syllables on the input text.
 
 This lets me refine my original goal of calculating readability to
 calculating sentence, word, and syllable counts on an input file. This
