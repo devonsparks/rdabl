@@ -2,6 +2,7 @@
 #+AUTHOR: Devon Sparks
 #+STARTUP: showeverything
 
+[[file:https://travis-ci.org/devonsparks/rdabl.svg?branch=master]]
 * Introduction
 
 While stuck on a transatlantic flight, cross-eyed and unable to sleep,
