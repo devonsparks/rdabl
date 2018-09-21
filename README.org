@@ -6,7 +6,7 @@
 * Introduction
 
 While stuck on a transatlantic flight, cross-eyed and unable to sleep,
-I go to wondering how to estimate the "readability" of English
+I got to wondering how to estimate the "readability" of English
 text. This literate program, written in part at 35,000 ft, is the
 result.
 
@@ -345,7 +345,6 @@ table_add(struct table *t, char *word, int value) {
     }
    
     if(strcmp(word, current->word) == 0) { /* entry already entered */
-      //current->occurrences++;
       current->value = value;
       return SUCCESS;
     }                                    /* entry is new */
